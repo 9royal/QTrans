@@ -1,0 +1,39 @@
+# ===================================================================
+#  QTrans .gitignore
+#
+#  第一段是安全性的，不要刪。設定檔裡有 API 金鑰（雖然是加密的），
+#  診斷報告裡有實際翻譯過的文字片段 —— 兩者都不該進版本控制。
+# ===================================================================
+
+# 設定與金鑰
+config.json
+*.key
+.env
+
+# 診斷工具的輸出（含實際翻譯內容）
+DIAGNOSTIC*.txt
+SELECT-DEBUG.txt
+select-debug.log
+*.log
+
+# 打包產物
+release/
+build/
+dist/
+*.spec
+*.zip
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+venv/
+.venv/
+
+# 編輯器與作業系統
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*.swp
