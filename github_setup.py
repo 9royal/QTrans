@@ -13,30 +13,100 @@ import os
 import shutil
 import subprocess
 import sys
+import traceback
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 REPO_NAME = "QTrans"
+LOG_PATH = ROOT / "GITHUB-LOG.txt"
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
 
+_log: list[str] = []
+
 
 def say(line: str = "") -> None:
     print(line, flush=True)
+    _log.append(line)
 
 
-def run(args: list[str], check: bool = True, quiet: bool = False):
-    """執行指令並回傳 CompletedProcess。"""
-    return subprocess.run(args, cwd=str(ROOT), check=check,
-                          capture_output=quiet, text=True,
-                          encoding="utf-8", errors="replace")
+def write_log() -> None:
+    """把整個過程寫成報告檔。
+
+    視窗一閃而過、或訊息刷太快看不清楚時，這個檔案是唯一的真相。
+    """
+    try:
+        LOG_PATH.write_text("\n".join(_log) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+
+# git 在繁體中文 Windows 上會用 cp950 輸出中文訊息，而我們是用 UTF-8
+# 去解讀它 —— 解出來就是「G;4JT06G 194」那種看不懂的東西。
+# 強迫 git 講英文（ASCII），兩邊就不會打架；英文訊息也比較好查。
+_ENV = {
+    **os.environ,
+    "LC_ALL": "C",
+    "LANG": "C",
+    "GIT_TERMINAL_PROMPT": "1",
+}
+
+
+def run(args: list[str], check: bool = False, quiet: bool = False):
+    """執行指令並回傳 CompletedProcess。
+
+    check 預設是 False。原本預設 True，任何一個指令失敗就拋例外、
+    視窗直接關掉，使用者只看得到一閃而過的畫面 —— 那比失敗本身更糟。
+    現在一律由呼叫端看 returncode 自己決定怎麼處理。
+    """
+    try:
+        proc = subprocess.run(args, cwd=str(ROOT), check=check,
+                              capture_output=quiet, text=True, env=_ENV,
+                              encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        say(f"  ✗ 找不到指令：{args[0]}")
+        raise
+    # 把每一道指令和結果都記進報告，出事時才查得出是哪一步。
+    _log.append(f"    $ {' '.join(args)}  → returncode={proc.returncode}")
+    if quiet:
+        for stream, tag in ((proc.stdout, "out"), (proc.stderr, "err")):
+            for line in (stream or "").splitlines():
+                _log.append(f"      [{tag}] {line}")
+    return proc
 
 
 def have(cmd: str) -> bool:
     return shutil.which(cmd) is not None
+
+
+def diagnose() -> None:
+    """把現場狀態收進報告檔。
+
+    只寫檔不印出來 —— 使用者不需要看這些，但我需要。
+    """
+    _log.append("")
+    _log.append("=" * 50)
+    _log.append("現場狀態（給排錯用）")
+    _log.append("=" * 50)
+    _log.append(f"資料夾：{ROOT}")
+    _log.append(f"Python：{sys.version}")
+    for args in (["git", "--version"],
+                 ["git", "remote", "-v"],
+                 ["git", "status", "--short", "--branch"],
+                 ["git", "branch", "-a"],
+                 ["git", "log", "--oneline", "-3"],
+                 ["gh", "--version"],
+                 ["gh", "auth", "status"]):
+        if not have(args[0]):
+            _log.append(f"    $ {' '.join(args)}  → 沒有安裝")
+            continue
+        try:
+            run(args, quiet=True)
+        except Exception as exc:
+            _log.append(f"    $ {' '.join(args)}  → 例外：{exc}")
 
 
 def ask(prompt: str, options: dict[str, str]) -> str:
@@ -114,7 +184,13 @@ def init_repo() -> bool:
     if (ROOT / ".git").is_dir():
         say("  ✓ 已經是 git 儲存庫了，沿用現有的")
     else:
-        run(["git", "init"], quiet=True)
+        inited = run(["git", "init"], quiet=True)
+        if inited.returncode != 0:
+            say("  ✗ git init 失敗：")
+            for line in ((inited.stderr or "") + (inited.stdout or "")).splitlines()[:8]:
+                say(f"      {line}")
+            diagnose()
+            return False
         say("  ✓ 已初始化")
 
     # 沒設過身分的話 git commit 會直接失敗，先補上。
@@ -138,7 +214,13 @@ def init_repo() -> bool:
             return False
         say("  ✓ 已記住")
 
-    run(["git", "add", "-A"], quiet=True)
+    added = run(["git", "add", "-A"], quiet=True)
+    if added.returncode != 0:
+        say("  ✗ git add 失敗：")
+        for line in ((added.stderr or "") + (added.stdout or "")).splitlines()[:8]:
+            say(f"      {line}")
+        diagnose()
+        return False
     say()
     return True
 
@@ -146,7 +228,7 @@ def init_repo() -> bool:
 # ---------------------------------------------------------------- 確認內容
 
 RISKY = ("config.json", ".env", ".key", "select-debug.log",
-         "DIAGNOSTIC", "SELECT-DEBUG")
+         "DIAGNOSTIC", "SELECT-DEBUG", "GITHUB-LOG")
 
 
 def confirm_files() -> bool:
@@ -246,12 +328,26 @@ def push(mode: str, visibility: str) -> bool:
         say(f"  正在建立 {REPO_NAME} 並上傳……")
         say()
         created = run(["gh", "repo", "create", REPO_NAME, visibility,
-                       "--source=.", "--push"], check=False)
+                       "--source=.", "--push"], quiet=True)
         if created.returncode != 0:
+            detail = ((created.stderr or "") + (created.stdout or "")).strip()
             say()
-            say("  ✗ 建立失敗。最常見的原因是你的帳號下已經有同名的存放庫。")
-            say(f"    到 https://github.com/new 看看 {REPO_NAME} 是不是已經存在。")
+            say("  ✗ 建立失敗。GitHub 回報的原因：")
+            say()
+            for line in detail.splitlines()[:12]:
+                say(f"      {line}")
+            say()
+            if "already exists" in detail or "Name already" in detail:
+                say("    你的帳號下已經有一個叫 QTrans 的存放庫了。")
+                say("    要嘛去 GitHub 把舊的刪掉或改名，要嘛改用更新指令：")
+                say("        git remote add origin https://github.com/<你的帳號>/QTrans.git")
+                say("        git push -u origin main")
+            elif "GraphQL" in detail or "403" in detail:
+                say("    權限不足。執行 gh auth login 重新登入一次，")
+                say("    登入時記得勾選 repo 權限。")
+            diagnose()
             return False
+        say(created.stdout or "")
 
         url = run(["git", "remote", "get-url", "origin"],
                   check=False, quiet=True).stdout.strip()
@@ -273,42 +369,101 @@ def push(mode: str, visibility: str) -> bool:
             pass
         return True
 
-    # 沒有 gh：引導手動建立
+    # 沒有 gh：引導手動建立。
+    #
+    # 這條路徑原本有個洞：它問完帳號就直接 push，完全沒確認網頁上那個
+    # 存放庫真的建好了。使用者只要漏掉「按 Create repository」那一下，
+    # push 就會以 "Repository not found" 失敗，而錯誤訊息裡看不出
+    # 真正的原因是「存放庫根本不存在」。現在 push 前一定先驗一次。
     say("  沒有 GitHub CLI，所以存放庫要你自己在網頁上建一個空的。")
     say()
-    say("  1. 正在開啟 https://github.com/new")
-    say(f"  2. Repository name 填：{REPO_NAME}")
-    say(f"  3. 選 {'Public' if visibility == '--public' else 'Private'}")
-    say("  4. 下面三個勾選框（README、.gitignore、license）全部不要勾")
-    say("  5. 按 Create repository")
-    say()
-    try:
-        os.startfile("https://github.com/new")
-    except Exception:
-        say("     網址：https://github.com/new")
-    say()
-    try:
-        account = input("  建好之後，把你的 GitHub 帳號名稱輸入這裡：").strip()
-    except Exception:
-        return False
+
+    # 如果之前已經設過 remote，沿用它的帳號，不要再問一次。
+    existing = run(["git", "remote", "get-url", "origin"], quiet=True)
+    account = ""
+    if existing.returncode == 0:
+        url = existing.stdout.strip()
+        parts = url.rstrip("/").replace(".git", "").split("/")
+        if len(parts) >= 2:
+            account = parts[-2]
+            say(f"  （沿用上次設定的帳號：{account}）")
+            say()
+
     if not account:
-        say("  沒有輸入帳號，停在這裡。")
+        try:
+            account = input("  先輸入你的 GitHub 帳號名稱：").strip()
+        except Exception:
+            return False
+        if not account:
+            say("  沒有輸入帳號，停在這裡。")
+            return False
+        say()
+
+    kind = "public" if visibility == "--public" else "private"
+    new_url = f"https://github.com/new?name={REPO_NAME}&visibility={kind}"
+    say("  接下來請在瀏覽器裡建立存放庫：")
+    say()
+    say(f"  1. 正在開啟建立頁面（名稱與公開設定已經幫你填好）")
+    say("  2. 下面三個勾選框（README、.gitignore、license）全部不要勾")
+    say("  3. 按最下面綠色的「Create repository」")
+    say()
+    say("  ※ 一定要真的按到那顆按鈕。只開頁面不按，存放庫不會存在，")
+    say("    等一下上傳就會失敗。")
+    say()
+    try:
+        os.startfile(new_url)
+    except Exception:
+        say(f"     網址：{new_url}")
+    say()
+    try:
+        input("  建好之後，回到這裡按 Enter 繼續…")
+    except Exception:
         return False
 
     remote = f"https://github.com/{account}/{REPO_NAME}.git"
-    run(["git", "remote", "remove", "origin"], check=False, quiet=True)
+    run(["git", "remote", "remove", "origin"], quiet=True)
     run(["git", "remote", "add", "origin", remote], quiet=True)
-    run(["git", "branch", "-M", "main"], check=False, quiet=True)
+    run(["git", "branch", "-M", "main"], quiet=True)
+
+    # 先問 GitHub：這個存放庫到底存不存在。
+    say()
+    say("  正在確認存放庫是否已經建立……")
+    probe = run(["git", "ls-remote", remote], quiet=True)
+    if probe.returncode != 0:
+        detail = ((probe.stderr or "") + (probe.stdout or "")).strip()
+        say()
+        say(f"  ✗ GitHub 上找不到 {account}/{REPO_NAME}")
+        say()
+        for line in detail.splitlines()[:6]:
+            say(f"      {line}")
+        say()
+        say("    最可能的原因：剛才的建立頁面沒有按到「Create repository」。")
+        say(f"    請到 https://github.com/{account}?tab=repositories 確認，")
+        say("    建好之後再執行一次這個檔案（前面的步驟會自動跳過）。")
+        diagnose()
+        return False
+    say("  ✓ 存放庫在")
     say()
     say("  正在上傳……（可能會跳出 GitHub 登入視窗）")
     say()
-    pushed = run(["git", "push", "-u", "origin", "main"], check=False)
+    pushed = run(["git", "push", "-u", "origin", "main"], quiet=True)
     if pushed.returncode != 0:
+        detail = ((pushed.stderr or "") + (pushed.stdout or "")).strip()
         say()
-        say("  ✗ 上傳失敗。最常見的兩個原因：")
-        say("     ・帳號名稱打錯了")
-        say("     ・剛才建立存放庫時勾了 README，導致兩邊對不起來")
-        say(f"       那就改執行：git push -u origin main --force")
+        say("  ✗ 上傳失敗。git 回報的原因：")
+        say()
+        for line in detail.splitlines()[:12]:
+            say(f"      {line}")
+        say()
+        if "not found" in detail.lower() or "repository not found" in detail.lower():
+            say("    GitHub 上找不到這個存放庫。可能是帳號名稱打錯，")
+            say("    或剛才建立時沒按到 Create repository。")
+        elif "rejected" in detail.lower() or "non-fast-forward" in detail.lower():
+            say("    建立存放庫時勾了 README，兩邊對不起來。執行：")
+            say("        git push -u origin main --force")
+        elif "authentication" in detail.lower() or "denied" in detail.lower():
+            say("    登入失敗。再執行一次，登入視窗出現時用瀏覽器登入。")
+        diagnose()
         return False
 
     url = f"https://github.com/{account}/{REPO_NAME}"
@@ -364,7 +519,35 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    code = main()
+    # 任何沒預期到的錯誤都要留在畫面上，而不是讓視窗一閃而過。
+    # 之前就是這樣：main() 拋例外 → 下面的 input() 根本沒機會執行 →
+    # 使用者只看到一串來不及讀的字。
+    try:
+        code = main()
+    except KeyboardInterrupt:
+        say()
+        say("  已中斷，什麼都沒有上傳。")
+        code = 1
+    except Exception:
+        code = 1
+        say()
+        say("=" * 58)
+        say("  程式出錯了")
+        say("=" * 58)
+        say()
+        for line in traceback.format_exc().splitlines():
+            say(f"  {line}")
+        say()
+        try:
+            diagnose()
+        except Exception:
+            pass
+
+    write_log()
+    say()
+    say(f"  完整過程已寫入：{LOG_PATH}")
+    if code != 0:
+        say("  請把這個檔案的內容回報給 Claude。")
     say()
     try:
         input("按 Enter 關閉...")
